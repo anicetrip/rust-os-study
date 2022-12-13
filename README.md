@@ -1,4 +1,3 @@
-# rust-os-study
 # 零、当前位置
 
 根据[2022 年开源操作系统培训计划][https://github.com/LearningOS/rust-based-os-comp2022]。 
@@ -29,6 +28,7 @@ sudo apt-get install git-email libaio-dev libbluetooth-dev libcapstone-dev libbr
 wget https://download.qemu.org/qemu-7.2.0-rc4.tar.xz
 tar xvJf qemu-7.2.0-rc4.tar.xz
 cd qemu-7.2.0-rc4
+#这里和官网不一样是按教程的
 ./configure --target-list=riscv64-softmmu,riscv64-linux-user 
 make -j$(nproc)
 
@@ -43,7 +43,7 @@ make -j$(nproc)
 make -j$(nproc)
 ```
 
-会有接近1万个文件需要编译，是个超级超级大的工程。
+第一次直接按官网的操作了，然后会有接近1万个文件需要编译，是个超级超级大的工程，然后如果按教程给的操作只要编译两千个就好了，节约了很多。
 
 然后配置path，我参考的如下
 
@@ -93,7 +93,15 @@ rustup component add llvm-tools-preview
 rustup component add rust-src
 ```
 
-## 1.4 检查是否安装正确（试运行）
+## 1.4安装riscv-gdb调试器
+
+首先上[下载链接][https://github.com/sifive/freedom-tools/releases/tag/v2020.12.0]，之所以要下载这个是因为ubuntu22不再可以直接安装，我看了一下源码安装源码就6个g，从我服务器硬盘角度来说根本无法接受，所以找了一下，运气很好的找到了已经编译好直接可用的版本。
+
+直接`tar -zxvf <下载的文件名>`然后在bin文件中，直接打开之后配置shell即可。
+
+
+
+## 1.5 检查是否安装正确（试运行）
 
 ```
 git clone  ``Github-Classroom帮你生成的某个OS实验的仓库``
@@ -192,4 +200,35 @@ Qemu 模拟的启动流程则可以分为三个阶段：第一个阶段由固化
 * 第一阶段：Qemu CPU 的程序计数器（PC）会被初始化为 `0x1000` ，因此 Qemu 实际执行的第一条指令位于物理地址 `0x1000` ，执行数条指令并跳转到物理地址 `0x80000000` 。
 * 第二阶段：在 `0x80000000`的bootloader负责初始化计算机，并跳转到下一阶段（内核）的程序入口。选用的RustSBI将其固定为`0x80200000`。
 * 第三阶段：执行内核的代码。
+
+## 内存布局模式
+
+|             |         |              |
+| ----------- | ------- | ------------ |
+|             |         | High Address |
+| --↓---      | stack   |              |
+|             | --↓---  |              |
+|             | --↑---  |              |
+| Data Memory | heap    |              |
+|             | .bss    |              |
+|             | .data   |              |
+| --↑---      | .rodata |              |
+| Code Memory | .text   | Low Address  |
+|             |         |              |
+
+* `.rodata`只读全局数据（常量）
+* `.data`全局变量
+* `.bss`未初始的全局数据
+
+## 编译流程
+
+编译器→汇编器→连接器
+
+* 编译器： 高级语言转汇编
+* 汇编器：汇编转二进制
+  * 按内存布局，拼装所有相关的汇编文件。
+  * 将符号替换为具体地址
+    * 将（内部）函数，变量等替换为对应的函数，变量地址。
+* 连接器：二进制文件与必要的外部依赖文件链接到一起获得可执行文件。
+  * 将（外部）函数，变量替换为对应地址。
 
