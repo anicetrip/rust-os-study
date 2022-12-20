@@ -1,2 +1,4 @@
 asm_err.txt
 asm.txt
+target/
+.vscode
