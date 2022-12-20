@@ -219,6 +219,9 @@ Qemu 模拟的启动流程则可以分为三个阶段：第一个阶段由固化
 * `.rodata`只读全局数据（常量）
 * `.data`全局变量
 * `.bss`未初始的全局数据
+* 栈： 在 RISC-V 架构中，栈是从高地址向低地址增长的
+  * 栈帧（stack frame）标识一个函数所使用的栈的一部分区域
+  * 一般而言，当前执行函数的栈帧的两个边界分别由栈指针 (Stack Pointer)寄存器和栈帧指针（frame pointer）寄存器来限定。
 
 ## 编译流程
 
@@ -231,4 +234,304 @@ Qemu 模拟的启动流程则可以分为三个阶段：第一个阶段由固化
     * 将（内部）函数，变量等替换为对应的函数，变量地址。
 * 连接器：二进制文件与必要的外部依赖文件链接到一起获得可执行文件。
   * 将（外部）函数，变量替换为对应地址。
+
+## 代码分析
+
+### 配置
+
+#### cargo 配置
+
+```toml
+# os/.cargo/config
+# 修改编译运行环境为riscv64，这里的elf 表示没有标准的运行时库（表明没有任何系统调用的封装支持）
+[build]
+target = "riscv64gc-unknown-none-elf"
+
+# -T表示强制使用特定的编译器配置脚本，而不是使用默认配置。
+# -C不懂，force-frame-pointers会多使用一个寄存器用于保存栈指针，提供给调试工具查找变量等内容，缺点在于会影响性能。
+ [target.riscv64gc-unknown-none-elf]
+ rustflags = [
+     "-Clink-arg=-Tsrc/linker.ld", "-Cforce-frame-pointers=yes"
+ ] 
+
+```
+
+#### 汇编预处理配置
+
+ ```asm
+# os/src/entry.asm
+    .section .text.entry # 将第二行到第六行的部分放在 .text.entry的部分
+    .globl _start # 设置 _start为全局符号
+_start: # 冒号将指针指向紧跟着的内容
+    la sp, boot_stack_top #栈指针 sp 设置为先前分配的启动栈栈顶地址，这样 Rust 代码在进行函数调用和返回的时候就可以正常在启动栈上分配和回收栈帧了
+    call rust_main #通过伪指令 call 调用 Rust 编写的内核入口点 rust_main 将控制权转交给 Rust 代码
+
+    .section .bss.stack # 将第八行到13行的部分放在 .bss.stack块中
+    .globl boot_stack_lower_bound # 设置全局变量
+boot_stack_lower_bound: #冒号将指针指向紧跟着的内容
+    .space 4096 * 16 #从low的地方往上预留了一块大小为 4096 * 16 字节也就是  的空间用作接下来要运行的程序的栈空间
+    .globl boot_stack_top # 设置boot_stack_top为全局符号
+boot_stack_top: #冒号将指针指向紧跟着的内容
+ ```
+
+#### 连接器配置
+
+```livescript
+OUTPUT_ARCH(riscv) # 设置目标平台
+ENTRY(_start) # 设置启动点
+BASE_ADDRESS = 0x80200000; # 定义常量为初始化代码需要被放置的地方。
+# "SECTIONS "命令告诉链接器如何将输入部分映射到输出部分，以及如何将输出部分放在内存中。
+SECTIONS
+{
+    . = BASE_ADDRESS; # 将内存指针指向初始化位置，链接器链接是按照SECTIONS里的段顺序排列的，前面的排列完之后就能计算出当前地址
+    skernel = .; # 开始内核代码
+	# 代码段
+    stext = .; # 开始.test部分
+    .text : {
+        *(.text.entry) # 让.text.entry在其他的.text之前
+        *(.text .text.*)
+    }
+
+    . = ALIGN(4K); #4k对齐
+    etext = .; #结束代码段
+    srodata = .; #设置只读数据起点
+    .rodata : { #只读存储位置
+        *(.rodata .rodata.*) # 存入只读内容
+        *(.srodata .srodata.*) #微型只读数据，因为可以通过特定的方式更快获取数据所以额外增加模型。
+    }
+
+    . = ALIGN(4K);
+    erodata = .; # 设置只读数据终点
+    # data段用于将flash中的数据和函数复制到内存并初始化。
+    sdata = .;
+    .data : { 
+        *(.data .data.*)
+        *(.sdata .sdata.*) # 微型data
+    }
+
+    . = ALIGN(4K);
+    edata = .;
+    # .bss段用于未初始的数据，这个段中的内容在启动时会被清零
+    .bss : {
+        *(.bss.stack) # 这里是之前汇编中设置的栈的位置
+        sbss = .;
+        *(.bss .bss.*)
+        *(.sbss .sbss.*)
+    }
+
+    . = ALIGN(4K);
+    ebss = .;
+    ekernel = .;
+   # 不存入
+    /DISCARD/ : {
+        *(.eh_frame) # 用于异常处理相关的堆栈表
+    }
+}
+```
+
+其中`srodata`的解释[来源][https://www.reddit.com/r/gcc/comments/pgjhey/gcc_sections/]
+
+#### rust-sbi接口配置
+
+```rust
+// os/src/sbi.rs
+// 服务类型常量
+#![allow(unused)] // 此行请放在该文件最开头
+const SBI_SET_TIMER: usize = 0;
+const SBI_CONSOLE_PUTCHAR: usize = 1;
+const SBI_CONSOLE_GETCHAR: usize = 2;
+const SBI_CLEAR_IPI: usize = 3;
+const SBI_SEND_IPI: usize = 4;
+const SBI_REMOTE_FENCE_I: usize = 5;
+const SBI_REMOTE_SFENCE_VMA: usize = 6;
+const SBI_REMOTE_SFENCE_VMA_ASID: usize = 7;
+const SBI_SHUTDOWN: usize = 8;
+
+// 调用sbi接口， which中为sbi_call的接口名，接下来可以接受最多3个参数
+use core::arch::asm;
+#[inline(always)] // 建议编译器将指定的函数体插入并取代每一处调用该函数的地方
+fn sbi_call(which: usize, arg0: usize, arg1: usize, arg2: usize) -> usize {
+    let mut ret;
+    unsafe {
+        asm!(
+            "ecall",
+            inlateout("x10") arg0 => ret, //inlateout(<reg>) <in expr> => <out expr> 先存入，然后再获取返回值（非原子情况返回的内容可能会提前洗掉输入）
+            in("x11") arg1, //in(<reg>) <expr>， reg: 寄存器类或者实际寄存器。 expr： 传入的变量
+            in("x12") arg2,
+            in("x17") which,
+        );
+    }
+    ret
+}
+
+
+pub fn shutdown() -> ! {
+    sbi_call(SBI_SHUTDOWN, 0, 0, 0);
+    panic!("It should shutdown!");
+}
+
+
+pub fn console_putchar(c: usize) {
+    sbi_call(SBI_CONSOLE_PUTCHAR, c, 0, 0);
+}
+```
+
+对于x^n^ :(只看说明有的部分,其他忽略即可)
+
+| Register | ABI Name | Description                      | Description-CN      | Saver  | 说明                                                         |
+| -------- | -------- | -------------------------------- | ------------------- | ------ | ------------------------------------------------------------ |
+| x0       | zero     | Hard-wired zero                  | 设为不可变0         | --     | 恒为零，函数调用不会对它产生影响                             |
+| x1       | ra       | Return address                   | 返回地址            | Caller | 是调用者保存的，但是与其他调用者保存的寄存器不同的是它会被保存在被调用者函数的栈帧中。前面提到过它的作用是让被调用者函数能够正确跳转回调用者函数继续向下执行。 |
+| x2       | sp       | Stack pointer                    | 栈指针              | Callee |                                                              |
+| x3       | gp       | Global pointer                   | 全局指针            | --     |                                                              |
+| x4       | tp       | Thread pointer                   | 线程指针            | -–     |                                                              |
+| x5-7     | t0–2     | Temporaries                      | 临时变量            | Caller | 作为临时寄存器使用，在被调函数中可以随意使用无需保存。       |
+| x8       | s0/fp    | Saved register/frame pointer     |                     | Callee | 作为临时寄存器使用，被调函数保存后才能在被调函数中使用。<br />它既可作为s0临时寄存器，也可作为栈帧指针（Frame Pointer）寄存器，表示当前栈帧的起始位置，是一个被调用者保存寄存器。 （标识一个函数所使用的栈的一部分区域） |
+| x9       | s1       | Saved register                   |                     | Callee | 作为临时寄存器使用，被调函数保存后才能在被调函数中使用。     |
+| x10-11   | a0–1     | Function arguments/return values | 函数参数/函数返回值 | Caller | 用来传递输入参数, 同时a0, a1用来保存返回值。                 |
+| x12-17   | a2–7     | Function arguments               | 函数参数            | Caller | 用来传递输入参数                                             |
+| x18-27   | s2–11    | Saved registers                  |                     | Callee | 作为临时寄存器使用，被调函数保存后才能在被调函数中使用。     |
+| x28-31   | t3–6     | Temporaries                      |                     | Caller | 作为临时寄存器使用，在被调函数中可以随意使用无需保存。       |
+| f0-7     | ft0–7    | FP temporaries                   |                     | Caller |                                                              |
+| f8-9     | fs0–1    | FP saved registers               |                     | Callee |                                                              |
+| f10-11   | fa0–1    | FP arguments/return values       |                     | Caller |                                                              |
+| f12-17   | fa2–7    | FP arguments                     |                     | Caller |                                                              |
+| f18-27   | fs2–11   | FP saved registers               |                     | Callee |                                                              |
+| f28-31   | ft8–11   | FP temporaries                   |                     | Caller |                                                              |
+
+一些从[doc][https://riscv.org/wp-content/uploads/2015/01/riscv-calling.pdf]拿到的暂时不相关内容：
+
+> In addition to the argument and return value registers, seven integer registers t0–t6 and twelve floating-point registers ft0–ft11 are temporary registers that are volatile across calls and must be saved by the caller if later used. Twelve integer registers s0–s11 and twelve floating-point registers fs0–fs11 are preserved across calls and must be saved by the callee if used. 
+>
+> the stack grows downward and the stack pointer is always kept 16-byte aligned.
+
+### 代码块
+
+#### 终端打印文件
+
+宏魔法跳过
+
+```rust
+// os/src/console.rs
+use crate::sbi::console_putchar;
+use core::fmt::{self, Write};
+
+struct Stdout;
+
+impl Write for Stdout {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for c in s.chars() {
+            console_putchar(c as usize);
+        }
+        Ok(())
+    }
+}
+
+pub fn print(args: fmt::Arguments) {
+    Stdout.write_fmt(args).unwrap();
+}
+
+#[macro_export]
+macro_rules! print {
+    ($fmt: literal $(, $($arg: tt)+)?) => {
+        $crate::console::print(format_args!($fmt $(, $($arg)+)?));
+    }
+}
+
+#[macro_export]
+macro_rules! println {
+    ($fmt: literal $(, $($arg: tt)+)?) => {
+        $crate::console::print(format_args!(concat!($fmt, "\n") $(, $($arg)+)?));
+    }
+}
+```
+
+#### 错误处理
+
+由于rust core中没有包含panic的错误处理程序，所以需要手写一个处理，可读性挺好的。
+
+```rust
+// os/src/lang_items.rs
+use crate::sbi::shutdown;
+use core::panic::PanicInfo;
+
+
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    if let Some(location) = info.location() {
+        println!(
+            "Panicked at {}:{} {}",
+            location.file(),
+            location.line(),
+            info.message().unwrap()
+        );
+    } else {
+        println!("Panicked: {}", info.message().unwrap());
+    }
+    shutdown()
+}
+```
+
+### main模块
+
+#### 预处理模块
+
+```rust
+// os/src/main.rs
+#![no_std] // 不使用 Rust 标准库 std 转而使用核心库 core（core库不需要操作系统的支持）
+#![no_main] //停用对于main的预处理过程
+#![feature(panic_info_message)]
+#[macro_use] //一定在最前面否则会报错找不到
+mod console;//一定在最前面否则会报错找不到
+mod sbi;
+mod lang_items;
+
+use core::arch::global_asm;
+//调用汇编
+use sbi::console_putchar;
+global_asm!(include_str!("entry.asm"));
+```
+
+#### 功能函数
+
+```rust
+fn clear_bss() {
+    extern "C" {//extern “C” 可以引用一个外部的 C 函数接口
+        //sbss 和 ebss ，它们由链接脚本 linker.ld 给出，并分别指出需要被清零的 .bss 段的起始和终止地址。
+        fn sbss();
+        fn ebss();
+    }
+    //设为u8因为u8为一个位
+    (sbss as usize..ebss as usize).for_each(|a| {
+        unsafe { (a as *mut u8).write_volatile(0) }
+    });
+}
+
+```
+
+
+
+#### 核心函数
+
+打印单个ASSIC字母
+
+```rust
+#[no_mangle] //告知编译器不混淆、替换函数名
+pub fn rust_main() -> ! {
+    clear_bss();
+    console_putchar(44); 
+    panic!("Shutdown machine!");
+}
+```
+
+打印整句
+
+```rust
+#[no_mangle]
+pub fn rust_main() -> ! {
+     clear_bss();
+     println!("Hello, world!");
+     panic!("Shutdown machine!");
+}
+```
 
